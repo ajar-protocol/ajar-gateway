@@ -2,6 +2,8 @@
 
 Start with the org-wide [CONTRIBUTING.md](https://github.com/ajar-protocol/.github/blob/main/CONTRIBUTING.md) and [AGENTS.md](https://github.com/ajar-protocol/.github/blob/main/AGENTS.md). They apply fully here.
 
+Use the org-wide [TESTING.md](https://github.com/ajar-protocol/.github/blob/main/TESTING.md) for unit, conformance, adversarial, and end-to-end evidence expectations.
+
 This repo is the reference site-side server. Phase 1 implementation is kicking off with the read layer; actions follow in Phase 3. The backlog is planning tasks T1.1-T1.15, with T3 work later. ADR-009's Rust-core stack decision is to be finalized at kickoff.
 
 ## Wanted now
