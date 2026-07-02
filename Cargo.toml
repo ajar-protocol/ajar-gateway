@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/signer",
+    "crates/policy-engine",
+    "crates/serving",
+    "crates/harvester",
+    "crates/extractor",
+    "crates/inducer",
+    "crates/store",
+    "crates/ajar-gateway",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ajar-protocol/ajar-gateway"
+
