@@ -160,8 +160,20 @@ Owner policy MUST NOT lower protocol floors.
 - Never log secrets, key material, mandate contents, receipt contents, or View content at INFO.
 - Never introduce telemetry or phone-home behavior.
 
-## When issue #15 closes ADR-009 stack mechanics
+## Stack conventions (ADR-018)
 
-In the same PR that closes issue #15, add stack conventions here.
-Include toolchain version, formatter command, linter command, unit-test command, conformance command, fuzz or adversarial-test command where applicable, and generated-code rules.
-Do not put stack conventions only in README text.
+Decided in `ajar/DECISIONS.md` ADR-018; issue #15 is closed.
+
+- Toolchain: pinned stable Rust via `rust-toolchain.toml`. MSRV = the stable release pinned there. Do not float the channel.
+- Layout: Cargo workspace, one crate per bounded module: `signer`, `policy-engine`, `serving`, `harvester`, `extractor`, `inducer`, `store`, and the `ajar-gateway` binary crate. The crate graph MUST match the dependency direction in this file; a core crate MUST NOT depend on an edge crate.
+- HTTP stack: tokio + axum + tower. Framework code stays inside the `serving` crate.
+- TLS: rustls. OpenSSL is forbidden.
+- Crypto: ed25519-dalek and the RFC 8785 JCS implementation live in the `signer` crate only. No other crate may depend on a crypto library.
+- Serialization: serde and serde_json.
+- Errors: thiserror-typed per crate. `anyhow` is forbidden in library crates.
+- Safety: `#![forbid(unsafe_code)]` in every crate. A future signer exception requires its own documented justification and human review.
+- Format: `cargo fmt --check` clean, default rustfmt config.
+- Lint: `cargo clippy --all-targets -- -D warnings` clean. A suppression requires an inline justification comment.
+- Tests: `cargo test` for units; conformance harness per `.github/TESTING.md` when it lands.
+- Dependencies: `cargo deny check` clean in CI (license allowlist and advisories).
+- Generated code declares its generator and inputs and is never hand-edited.

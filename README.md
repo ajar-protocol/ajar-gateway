@@ -18,4 +18,4 @@ Owner sovereignty (drafts never auto-publish; safe defaults; authenticated areas
 ## Deployment shapes (all conformance-equal)
 Standalone binary/Docker reverse proxy · CMS plugins (`ajar-woocommerce`, publishes at Stage 4, may embed or front this Gateway) · edge/CDN workers · native library for greenfield sites. The Next.js path in `ajar-examples` (publishes across Phases 1-3 demos) implements Ajar without a Gateway.
 
-Stack: ADR-009 (Rust core, proposed; finalize at Phase-1 kickoff). License: Apache-2.0. Commercial managed offerings of this software are welcome (ADR-011).
+Stack: Rust core per ADR-009; mechanics per ADR-018 (pinned stable toolchain, per-module crate workspace, tokio/axum, rustls, signer-confined crypto) — see AGENTS.md. License: Apache-2.0. Commercial managed offerings of this software are welcome (ADR-011).
