@@ -5,6 +5,9 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    # Unicode character-data license (unicode-ident, transitive via
+    # proc-macro2/syn). OSI-approved, permissive, BSD-class in effect.
+    "Unicode-3.0",
 ]
 confidence-threshold = 0.8
 
