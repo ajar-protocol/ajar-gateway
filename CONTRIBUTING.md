@@ -1,6 +1,6 @@
 # Contributing to ajar-gateway
 
-Start with the org-wide [CONTRIBUTING.md](https://github.com/ajar-protocol/.github/blob/main/CONTRIBUTING.md) and [AGENTS.md](https://github.com/ajar-protocol/.github/blob/main/AGENTS.md). They apply fully here.
+Start with the org-wide [CONTRIBUTING.md](https://github.com/ajar-protocol/.github/blob/main/CONTRIBUTING.md), org [AGENTS.md](https://github.com/ajar-protocol/.github/blob/main/AGENTS.md), and this repo's `AGENTS.md`, which is the binding Gateway architecture contract.
 
 Use the org-wide [TESTING.md](https://github.com/ajar-protocol/.github/blob/main/TESTING.md) for unit, conformance, adversarial, and end-to-end evidence expectations.
 
