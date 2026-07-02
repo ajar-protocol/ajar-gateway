@@ -253,6 +253,16 @@ impl PreparedContentStore {
     pub fn view_for_request_target(&self, request_target: &str) -> Option<&StoredView> {
         self.views_by_request_target.get(request_target)
     }
+
+    /// Returns the manifest sequence currently loaded in memory.
+    pub fn manifest_sequence(&self) -> i64 {
+        self.manifest.manifest.sequence
+    }
+
+    /// Returns the number of prepared Views currently loaded in memory.
+    pub fn view_count(&self) -> usize {
+        self.views_by_request_target.len()
+    }
 }
 
 /// Exact prepared artifact bytes plus a strong entity tag.

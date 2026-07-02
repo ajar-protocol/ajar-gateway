@@ -16,7 +16,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use http_body_util::Limited;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use store::{Clock, PreparedContentStore, StoredView, SystemClock};
 use thiserror::Error;
@@ -146,6 +146,8 @@ pub struct Metrics {
     views_served_total: AtomicU64,
     manifest_served_total: AtomicU64,
     negotiation_passthrough_total: AtomicU64,
+    store_reloads_total: AtomicU64,
+    store_reload_failures_total: AtomicU64,
 }
 
 impl Metrics {
@@ -175,6 +177,17 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the successful store reload counter.
+    pub fn increment_store_reloads_total(&self) {
+        self.store_reloads_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the failed store reload counter.
+    pub fn increment_store_reload_failures_total(&self) {
+        self.store_reload_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Renders the metrics endpoint body.
     pub fn render(&self) -> String {
         let requests_total = self.requests_total.load(Ordering::Relaxed);
@@ -183,22 +196,28 @@ impl Metrics {
         let manifest_served_total = self.manifest_served_total.load(Ordering::Relaxed);
         let negotiation_passthrough_total =
             self.negotiation_passthrough_total.load(Ordering::Relaxed);
+        let store_reloads_total = self.store_reloads_total.load(Ordering::Relaxed);
+        let store_reload_failures_total = self.store_reload_failures_total.load(Ordering::Relaxed);
         format!(
-            "requests_total {}\nupstream_errors_total {}\nviews_served_total {}\nmanifest_served_total {}\nnegotiation_passthrough_total {}\n",
+            "requests_total {}\nupstream_errors_total {}\nviews_served_total {}\nmanifest_served_total {}\nnegotiation_passthrough_total {}\nstore_reloads_total {}\nstore_reload_failures_total {}\n",
             requests_total,
             upstream_errors_total,
             views_served_total,
             manifest_served_total,
-            negotiation_passthrough_total
+            negotiation_passthrough_total,
+            store_reloads_total,
+            store_reload_failures_total
         )
     }
 }
+
+type SharedPreparedContentStore = Arc<RwLock<Arc<PreparedContentStore>>>;
 
 struct ProxyState {
     config: ValidatedConfig,
     client: Client<HttpConnector, Body>,
     metrics: Arc<Metrics>,
-    store: Option<Arc<PreparedContentStore>>,
+    store: Option<SharedPreparedContentStore>,
     clock: Arc<dyn Clock>,
     manifest_expiry_logged: AtomicBool,
 }
@@ -219,10 +238,9 @@ pub async fn serve_until_shutdown_with_clock(
 ) -> Result<(), ServingError> {
     let config = config.validate()?;
     let store = match &config.store_dir {
-        Some(path) => Some(Arc::new(PreparedContentStore::load_from_dir(
-            path,
-            clock.as_ref(),
-        )?)),
+        Some(path) => Some(Arc::new(RwLock::new(Arc::new(
+            PreparedContentStore::load_from_dir(path, clock.as_ref())?,
+        )))),
         None => None,
     };
     let public_listener = TcpListener::bind(config.listen_addr)
@@ -252,7 +270,7 @@ pub async fn serve_until_shutdown_with_clock(
     });
 
     let proxy_app = proxy_router(state.clone());
-    let admin_app = admin_router(state.metrics.clone());
+    let admin_app = admin_router(state.clone());
 
     let proxy_shutdown = shutdown_signal(shutdown_rx.clone());
     let admin_shutdown = shutdown_signal(shutdown_rx);
@@ -280,11 +298,12 @@ fn proxy_router(state: Arc<ProxyState>) -> Router {
     Router::new().fallback(proxy_request).with_state(state)
 }
 
-fn admin_router(metrics: Arc<Metrics>) -> Router {
+fn admin_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
-        .with_state(metrics)
+        .route("/reload", post(reload_store))
+        .with_state(state)
 }
 
 async fn shutdown_signal(mut receiver: watch::Receiver<bool>) {
@@ -303,7 +322,8 @@ async fn proxy_request(
     request: Request<Body>,
 ) -> Result<Response<Body>, ProxyHttpError> {
     state.metrics.increment_requests_total();
-    if let Some(store) = &state.store {
+    let current_store = current_store(&state)?;
+    if let Some(store) = current_store.as_ref() {
         if request.method() == Method::GET && request.uri().path() == MANIFEST_PATH {
             return Ok(serve_manifest(&state, store, request.headers()));
         }
@@ -317,10 +337,10 @@ async fn proxy_request(
                 let accept = combined_accept_header(request.headers());
                 match negotiate(accept.as_deref(), true) {
                     Representation::AjarJson => {
-                        return Ok(serve_view_json(&state, view, request.headers()));
+                        return Ok(serve_view_json(&state, store, view, request.headers()));
                     }
                     Representation::Markdown => {
-                        return Ok(serve_view_markdown(&state, view, request.headers()));
+                        return Ok(serve_view_markdown(&state, store, view, request.headers()));
                     }
                     Representation::Passthrough => {
                         state.metrics.increment_negotiation_passthrough_total();
@@ -351,7 +371,7 @@ async fn proxy_request(
 
     let (mut parts, body) = response.into_parts();
     strip_hop_by_hop_headers(&mut parts.headers);
-    if state.store.is_some() && is_html_content_type(&parts.headers) {
+    if current_store.is_some() && is_html_content_type(&parts.headers) {
         parts
             .headers
             .append(LINK, HeaderValue::from_static(AJAR_MANIFEST_LINK));
@@ -417,11 +437,14 @@ fn serve_view_index(
     response
 }
 
-fn serve_view_json(state: &ProxyState, view: &StoredView, headers: &HeaderMap) -> Response<Body> {
-    if let Some(store) = &state.store {
-        if let Some(response) = expired_manifest_problem(state, store) {
-            return response;
-        }
+fn serve_view_json(
+    state: &ProxyState,
+    store: &PreparedContentStore,
+    view: &StoredView,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    if let Some(response) = expired_manifest_problem(state, store) {
+        return response;
     }
     if if_none_match_matches(headers, &view.view().etag) {
         return empty_response(StatusCode::NOT_MODIFIED);
@@ -446,13 +469,12 @@ fn serve_view_json(state: &ProxyState, view: &StoredView, headers: &HeaderMap) -
 
 fn serve_view_markdown(
     state: &ProxyState,
+    store: &PreparedContentStore,
     view: &StoredView,
     headers: &HeaderMap,
 ) -> Response<Body> {
-    if let Some(store) = &state.store {
-        if let Some(response) = expired_manifest_problem(state, store) {
-            return response;
-        }
+    if let Some(response) = expired_manifest_problem(state, store) {
+        return response;
     }
     if if_none_match_matches(headers, &view.view().etag) {
         return empty_response(StatusCode::NOT_MODIFIED);
@@ -524,6 +546,16 @@ fn expired_manifest_problem(
     ))
 }
 
+fn current_store(state: &ProxyState) -> Result<Option<Arc<PreparedContentStore>>, ProxyHttpError> {
+    let Some(store) = &state.store else {
+        return Ok(None);
+    };
+    match store.read() {
+        Ok(guard) => Ok(Some(guard.clone())),
+        Err(_) => Err(ProxyHttpError::StoreStateUnavailable),
+    }
+}
+
 fn log_manifest_expired_once(state: &ProxyState) {
     if state
         .manifest_expiry_logged
@@ -534,6 +566,102 @@ fn log_manifest_expired_once(state: &ProxyState) {
             "{{\"level\":\"error\",\"event\":\"ajar_manifest_expired\",\"fields\":{{\"code\":\"AJAR-VERIFY-EXPIRED\"}}}}"
         );
     }
+}
+
+async fn reload_store(State(state): State<Arc<ProxyState>>) -> Response<Body> {
+    let Some(store_dir) = state.config.store_dir.as_ref() else {
+        return reload_failed(
+            &state,
+            "no content store configured".to_owned(),
+            "no_content_store_configured",
+        );
+    };
+    let Some(shared_store) = state.store.as_ref() else {
+        return reload_failed(
+            &state,
+            "no content store configured".to_owned(),
+            "no_content_store_configured",
+        );
+    };
+
+    let loaded_store = match PreparedContentStore::load_from_dir(store_dir, state.clock.as_ref()) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            return reload_failed(&state, error.to_string(), "validation_failed");
+        }
+    };
+
+    let views = loaded_store.view_count();
+    let manifest_sequence = loaded_store.manifest_sequence();
+    match shared_store.write() {
+        Ok(mut guard) => {
+            let current_sequence = guard.manifest_sequence();
+            if manifest_sequence < current_sequence {
+                return reload_failed(
+                    &state,
+                    "prepared manifest sequence is lower than the currently served sequence"
+                        .to_owned(),
+                    "sequence_rollback",
+                );
+            }
+            *guard = loaded_store;
+        }
+        Err(_) => {
+            return reload_failed(
+                &state,
+                "content store state unavailable".to_owned(),
+                "store_state_unavailable",
+            );
+        }
+    }
+
+    state.metrics.increment_store_reloads_total();
+    state.manifest_expiry_logged.store(false, Ordering::Relaxed);
+    log_event(
+        "info",
+        "store_reloaded",
+        serde_json::json!({
+            "views": views,
+            "manifest_sequence": manifest_sequence
+        }),
+    );
+
+    (
+        StatusCode::OK,
+        Json(ReloadSuccess {
+            status: "reloaded",
+            views,
+            manifest_sequence,
+        }),
+    )
+        .into_response()
+}
+
+fn reload_failed(state: &ProxyState, detail: String, reason: &'static str) -> Response<Body> {
+    state.metrics.increment_store_reload_failures_total();
+    log_event(
+        "error",
+        "store_reload_failed",
+        serde_json::json!({
+            "reason": reason,
+            "detail": detail
+        }),
+    );
+    problem_response(
+        StatusCode::CONFLICT,
+        "AJAR_GATEWAY_STORE_RELOAD_FAILED",
+        "Store reload failed",
+        &detail,
+    )
+}
+
+fn log_event(level: &str, event: &str, fields: serde_json::Value) {
+    let line = serde_json::json!({
+        "level": level,
+        "event": event,
+        "fields": fields
+    });
+    eprintln!("{line}");
 }
 
 /// Negotiated response representation for a same-URL Ajar view request.
@@ -752,6 +880,8 @@ enum ProxyHttpError {
     UpstreamTimeout,
     #[error("upstream request failed")]
     Upstream(#[source] hyper_util::client::legacy::Error),
+    #[error("content store state unavailable")]
+    StoreStateUnavailable,
 }
 
 impl ProxyHttpError {
@@ -761,6 +891,7 @@ impl ProxyHttpError {
             Self::InvalidUpstreamUri | Self::UpstreamTimeout | Self::Upstream(_) => {
                 StatusCode::BAD_GATEWAY
             }
+            Self::StoreStateUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -771,6 +902,7 @@ impl ProxyHttpError {
             Self::InvalidUpstreamUri => "AJAR_GATEWAY_INVALID_UPSTREAM_URI",
             Self::UpstreamTimeout => "AJAR_GATEWAY_UPSTREAM_TIMEOUT",
             Self::Upstream(_) => "AJAR_GATEWAY_UPSTREAM_ERROR",
+            Self::StoreStateUnavailable => "AJAR_GATEWAY_STORE_STATE_UNAVAILABLE",
         }
     }
 }
@@ -816,12 +948,19 @@ struct Health {
     status: &'static str,
 }
 
+#[derive(Serialize)]
+struct ReloadSuccess {
+    status: &'static str,
+    views: usize,
+    manifest_sequence: i64,
+}
+
 async fn healthz() -> Json<Health> {
     Json(Health { status: "ok" })
 }
 
-async fn metrics_endpoint(State(metrics): State<Arc<Metrics>>) -> Response<Body> {
-    let mut response = Response::new(Body::from(metrics.render()));
+async fn metrics_endpoint(State(state): State<Arc<ProxyState>>) -> Response<Body> {
+    let mut response = Response::new(Body::from(state.metrics.render()));
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -857,7 +996,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
     use std::sync::Arc;
     use store::Clock;
@@ -1225,6 +1364,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_swaps_content_store() -> Result<(), Box<dyn Error>> {
+        let origin = spawn_origin().await?;
+        let store_dir = write_store_fixture()?;
+        let clock = Arc::new(TestClock::new(0));
+        let gateway = spawn_gateway_with_store(origin.addr, 1024, store_dir.clone(), clock).await?;
+        let client = test_client();
+
+        let initial_body = get_markdown_body(&client, &gateway).await?;
+        assert!(initial_body.contains("Signed notes for readers and agents."));
+
+        rewrite_store_fixture(
+            &store_dir,
+            2,
+            "Reloaded Notes",
+            "Fresh signed content after reload.",
+            "view-article-002",
+        )?;
+        let reload_response = post_reload(&client, &gateway).await?;
+        let reload_status = reload_response.status();
+        let reload_body = reload_response.into_body().collect().await?.to_bytes();
+
+        assert_eq!(reload_status, StatusCode::OK);
+        assert_eq!(
+            reload_body,
+            Bytes::from_static(br#"{"status":"reloaded","views":1,"manifest_sequence":2}"#)
+        );
+        let reloaded_body = get_markdown_body(&client, &gateway).await?;
+        assert!(reloaded_body.contains("Fresh signed content after reload."));
+
+        gateway.shutdown();
+        origin.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_invalid_store_keeps_current_content() -> Result<(), Box<dyn Error>> {
+        let origin = spawn_origin().await?;
+        let store_dir = write_store_fixture()?;
+        let clock = Arc::new(TestClock::new(0));
+        let gateway = spawn_gateway_with_store(origin.addr, 1024, store_dir.clone(), clock).await?;
+        let client = test_client();
+
+        fs::write(store_dir.join("manifest.json"), "{}")?;
+        let reload_response = post_reload(&client, &gateway).await?;
+        let status = reload_response.status();
+        let headers = reload_response.headers().clone();
+        let body = reload_response.into_body().collect().await?.to_bytes();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            headers.get("content-type"),
+            Some(&HeaderValue::from_static("application/problem+json"))
+        );
+        assert!(
+            String::from_utf8(body.to_vec())?.contains("prepared manifest required field missing")
+        );
+        let current_body = get_markdown_body(&client, &gateway).await?;
+        assert!(current_body.contains("Signed notes for readers and agents."));
+
+        gateway.shutdown();
+        origin.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_lower_manifest_sequence() -> Result<(), Box<dyn Error>> {
+        let origin = spawn_origin().await?;
+        let store_dir = write_store_fixture()?;
+        rewrite_store_fixture(
+            &store_dir,
+            2,
+            "Reloaded Notes",
+            "Sequence two content.",
+            "view-article-002",
+        )?;
+        let clock = Arc::new(TestClock::new(0));
+        let gateway = spawn_gateway_with_store(origin.addr, 1024, store_dir.clone(), clock).await?;
+        let client = test_client();
+
+        rewrite_store_fixture(
+            &store_dir,
+            1,
+            "Rollback Notes",
+            "Rollback content must not serve.",
+            "view-article-001",
+        )?;
+        let reload_response = post_reload(&client, &gateway).await?;
+        let status = reload_response.status();
+        let body = reload_response.into_body().collect().await?.to_bytes();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(String::from_utf8(body.to_vec())?
+            .contains("prepared manifest sequence is lower than the currently served sequence"));
+        let current_body = get_markdown_body(&client, &gateway).await?;
+        assert!(current_body.contains("Sequence two content."));
+
+        gateway.shutdown();
+        origin.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_without_store_config_returns_409_and_get_is_405() -> Result<(), Box<dyn Error>>
+    {
+        let origin = spawn_origin().await?;
+        let gateway = spawn_gateway(origin.addr, 1024).await?;
+        let client = test_client();
+
+        let post_response = post_reload(&client, &gateway).await?;
+        let post_status = post_response.status();
+        let post_body = post_response.into_body().collect().await?.to_bytes();
+
+        assert_eq!(post_status, StatusCode::CONFLICT);
+        assert!(String::from_utf8(post_body.to_vec())?.contains("no content store configured"));
+
+        let reload_uri: Uri = format!("http://{}/reload", gateway.admin_addr).parse()?;
+        let get_response = client
+            .request(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(reload_uri)
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        assert_eq!(get_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        gateway.shutdown();
+        origin.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_metrics_counters_increment() -> Result<(), Box<dyn Error>> {
+        let origin = spawn_origin().await?;
+        let store_dir = write_store_fixture()?;
+        let clock = Arc::new(TestClock::new(0));
+        let gateway = spawn_gateway_with_store(origin.addr, 1024, store_dir.clone(), clock).await?;
+        let client = test_client();
+
+        rewrite_store_fixture(
+            &store_dir,
+            2,
+            "Reloaded Notes",
+            "Metrics success content.",
+            "view-article-002",
+        )?;
+        let success = post_reload(&client, &gateway).await?;
+        assert_eq!(success.status(), StatusCode::OK);
+
+        fs::write(store_dir.join("manifest.json"), "{}")?;
+        let failure = post_reload(&client, &gateway).await?;
+        assert_eq!(failure.status(), StatusCode::CONFLICT);
+
+        let metrics_uri: Uri = format!("http://{}/metrics", gateway.admin_addr).parse()?;
+        let metrics_response = client
+            .request(
+                axum::http::Request::builder()
+                    .uri(metrics_uri)
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        let metrics_body = metrics_response.into_body().collect().await?.to_bytes();
+        let metrics = String::from_utf8(metrics_body.to_vec())?;
+        assert!(metrics.contains("store_reloads_total 1"));
+        assert!(metrics.contains("store_reload_failures_total 1"));
+
+        gateway.shutdown();
+        origin.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn oversized_body_is_rejected() -> Result<(), Box<dyn Error>> {
         let origin = spawn_origin().await?;
         let gateway = spawn_gateway(origin.addr, 4).await?;
@@ -1393,11 +1704,74 @@ mod tests {
             "ajar-gateway-serving-test-{}-{nonce}",
             std::process::id()
         ));
-        fs::create_dir_all(dir.join("views"))?;
-        fs::write(dir.join("manifest.json"), MANIFEST_FIXTURE)?;
-        fs::write(dir.join("view-index.json"), VIEW_INDEX_FIXTURE)?;
-        fs::write(dir.join("views").join("article.json"), VIEW_FIXTURE)?;
+        rewrite_store_fixture(
+            &dir,
+            1,
+            "Example Notes",
+            "Signed notes for readers and agents.",
+            "view-article-001",
+        )?;
         Ok(dir)
+    }
+
+    fn rewrite_store_fixture(
+        dir: &Path,
+        sequence: i64,
+        heading: &str,
+        paragraph: &str,
+        view_etag: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        fs::create_dir_all(dir.join("views"))?;
+        let manifest = MANIFEST_FIXTURE
+            .replace("\"sequence\":1", &format!("\"sequence\":{sequence}"))
+            .replace(
+                "manifestNotesSignature001",
+                &format!("manifestNotesSignature{sequence:03}"),
+            );
+        let view_index =
+            format!(r#"{{"views":[{{"url":"/article?x=1","etag":"\"{view_etag}\""}}]}}"#);
+        let view = VIEW_FIXTURE
+            .replace("Example Notes", heading)
+            .replace("Signed notes for readers and agents.", paragraph)
+            .replace("view-article-001", view_etag)
+            .replace("viewSignature001", &format!("viewSignature{sequence:03}"));
+        fs::write(dir.join("manifest.json"), manifest)?;
+        fs::write(dir.join("view-index.json"), view_index)?;
+        fs::write(dir.join("views").join("article.json"), view)?;
+        Ok(())
+    }
+
+    async fn get_markdown_body(
+        client: &Client<HttpConnector, Full<Bytes>>,
+        gateway: &RunningGateway,
+    ) -> Result<String, Box<dyn Error>> {
+        let uri: Uri = format!("http://{}/article?x=1", gateway.public_addr).parse()?;
+        let response = client
+            .request(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header("accept", "text/markdown")
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        let body = response.into_body().collect().await?.to_bytes();
+        Ok(String::from_utf8(body.to_vec())?)
+    }
+
+    async fn post_reload(
+        client: &Client<HttpConnector, Full<Bytes>>,
+        gateway: &RunningGateway,
+    ) -> Result<Response<hyper::body::Incoming>, Box<dyn Error>> {
+        let uri: Uri = format!("http://{}/reload", gateway.admin_addr).parse()?;
+        let response = client
+            .request(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        Ok(response)
     }
 
     struct TestClock {
@@ -1423,9 +1797,6 @@ mod tests {
     }
 
     const MANIFEST_FIXTURE: &str = r#"{"ajar_version":"0.1","supported_versions":["0.1"],"profiles":["CORE"],"site":{"name":"Example Notes","domain":"notes.example","description":"Independent publication with signed semantic article views.","languages":["en"],"contact":"agents@notes.example"},"keys":{"owner":{"kty":"OKP","crv":"Ed25519","x":"ownerNotesPublicKeyExample001","kid":"owner-2026"},"operational":[{"key":{"kty":"OKP","crv":"Ed25519","x":"opsNotesPublicKeyExample001","kid":"content-2026-07"},"scope":["content-signing"],"valid_until":"2026-10-01T00:00:00Z","certification":{"alg":"Ed25519","kid":"owner-2026","sig":"certNotesContentSigner001"}}]},"views":{"negotiation":["application/ajar+json","text/markdown"],"index":"/ajar/views/index","chunking":{"stable_ids":true,"diff":"etag-per-chunk"},"license":{"read":"allowed","train":"denied","terms":"/ajar/license"}},"policy_summary":{"audience_tiers":["anonymous","signed"],"rate_limits":{"anonymous":"120/h","signed":"1200/h"},"requires_mandate_from_risk":"R2"},"issued_at":"2026-07-02T00:00:00Z","expires_at":"2026-10-01T00:00:00Z","sequence":1,"signature":{"alg":"Ed25519","kid":"owner-2026","sig":"manifestNotesSignature001"}}"#;
-
-    const VIEW_INDEX_FIXTURE: &str =
-        r#"{"views":[{"url":"/article?x=1","etag":"\"view-article-001\""}]}"#;
 
     const VIEW_FIXTURE: &str = r#"{"ajar_version":"0.1","url":"https://notes.example/article?x=1","content_type":"application/ajar+json","etag":"\"view-article-001\"","language":"en","chunks":[{"id":"article.title","type":"heading","content":"Example Notes","hash":"sha256:articleTitleHash001","links":[]},{"id":"article.summary","type":"paragraph","content":"Signed notes for readers and agents.","hash":"sha256:articleSummaryHash001","links":[]},{"id":"article.list","type":"list","content":"- First\n- Second","hash":"sha256:articleListHash001","links":[]}],"signature":{"alg":"Ed25519","kid":"content-2026-07","sig":"viewSignature001"}}"#;
 

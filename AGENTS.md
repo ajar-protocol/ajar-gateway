@@ -104,6 +104,13 @@ Each extension interface gets at least one test double.
 Concrete implementations live at the edges and are wired at startup.
 Core Gateway logic depends on interfaces only.
 
+## Integration seams are public API
+
+The prepared content-store format in `docs/CONTENT-STORE.md`, the admin control
+API, and the future action callback contract are versioned public interfaces.
+Changes to these seams follow `.github/ENGINEERING.md` versioning rules.
+Behavior or format changes require documentation updates in the same PR.
+
 Rendering engines are process-isolated behind CDP per ADR-010.
 Settlement adapters implement the PAY profile boundary.
 Storage backends store prepared artifacts, audit events, receipts, policies, and freshness metadata.

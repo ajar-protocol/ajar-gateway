@@ -67,11 +67,13 @@ must bind before serving begins.
 - If `store_dir` is omitted, `/.well-known/ajar.json` and all content URLs pass
   through to the origin unchanged.
 - If `store_dir` is configured, the Gateway loads all prepared artifacts into
-  memory at startup and performs no per-request disk reads. Hot reload is future
-  work; replace the store atomically and restart.
+  memory at startup and performs no per-request disk reads. Replace the store
+  atomically, then call `POST /reload` on the admin listener to hot-reload the
+  prepared artifacts without restarting.
 - The prepared store layout is documented in
   [`CONTENT-STORE.md`](CONTENT-STORE.md).
 - The admin listener is separate and should remain bound to a private interface.
+- The admin listener exposes `GET /healthz`, `GET /metrics`, and `POST /reload`.
 - Hop-by-hop request and response headers are stripped at the proxy boundary.
 - Request and response bodies stream through the Gateway; large bodies are not
   buffered into memory.
@@ -92,10 +94,21 @@ Prepare signed artifacts:
 
 Today, use `../ajar/tools/signing_profile.py` as the signing reference for
 canonical Ajar artifacts. After the files are in place, point `store_dir` at the
-directory and restart the Gateway. The public listener will serve:
+directory and start the Gateway. The public listener will serve:
 
 - `GET /.well-known/ajar.json` as the signed manifest.
 - `GET <manifest.views.index>` as `view-index.json`.
 - `GET <view.url>` with `Accept: application/ajar+json` as the signed View.
 - `GET <view.url>` with `Accept: text/markdown` as deterministic markdown
   derived from the signed View.
+
+To update a running Gateway, write the replacement store to a temporary
+directory, rename the complete store into place, then reload:
+
+```sh
+curl -i -X POST http://127.0.0.1:9090/reload
+```
+
+Successful reloads return `200` with the new View count and manifest sequence.
+Invalid stores, missing `store_dir`, and lower manifest sequences return
+`409 application/problem+json`; the old in-memory store keeps serving.

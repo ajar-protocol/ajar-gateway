@@ -16,7 +16,7 @@ Wraps an existing site as a reverse proxy, CMS plugin, or edge worker. It produc
 Owner sovereignty (drafts never auto-publish; safe defaults; authenticated areas unexposable without explicit override) · zero serve-path LLM calls · no telemetry (ADR-014) · fail closed with registry error codes · single audited signing module.
 
 ## Deployment shapes (all conformance-equal)
-Standalone binary/Docker reverse proxy · CMS plugins (`ajar-woocommerce`, publishes at Stage 4, may embed or front this Gateway) · edge/CDN workers · native library for greenfield sites. The Next.js path in `ajar-examples` (publishes across Phases 1-3 demos) implements Ajar without a Gateway.
+Standalone binary/Docker reverse proxy · CMS plugins (`ajar-woocommerce`, publishes at Stage 4, may embed or front this Gateway) · edge/CDN workers · native library for greenfield sites. See [`docs/INTEGRATION.md`](docs/INTEGRATION.md) for the engine-plus-adapters integration model. The Next.js path in `ajar-examples` (publishes across Phases 1-3 demos) implements Ajar without a Gateway.
 
 Stack: Rust core per ADR-009; mechanics per ADR-018 (pinned stable toolchain, per-module crate workspace, tokio/axum, rustls, signer-confined crypto) — see AGENTS.md. License: Apache-2.0. Commercial managed offerings of this software are welcome (ADR-011).
 
@@ -35,7 +35,8 @@ Stack: Rust core per ADR-009; mechanics per ADR-018 (pinned stable toolchain, pe
    ```
 
 3. Set `store_dir` in `gateway.toml`.
-4. Restart the Gateway.
+4. After replacing the store atomically, call `POST /reload` on the admin
+   listener.
 
 With `store_dir` set, the Gateway serves `/.well-known/ajar.json`, advertises it
 on proxied HTML responses with `rel="ajar-manifest"`, serves the View index at
@@ -43,7 +44,8 @@ on proxied HTML responses with `rel="ajar-manifest"`, serves the View index at
 accept `application/ajar+json` or `text/markdown`. Browsers and unsupported
 `Accept` headers continue to see the origin site.
 
-See [`docs/CONTENT-STORE.md`](docs/CONTENT-STORE.md) for the store contract.
+See [`docs/CONTENT-STORE.md`](docs/CONTENT-STORE.md) for the store contract and
+[`docs/INTEGRATION.md`](docs/INTEGRATION.md) for adapter integration seams.
 
 ## T1.2/T1.3 implementation status
 
